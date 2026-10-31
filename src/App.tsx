@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import {
   BoxGeometry,
@@ -89,11 +89,18 @@ interface SceneObject {
   segments: number;
   geometryData?: { positions: number[]; indices: number[] } | null;
   constructionCode?: string;
+  groupId?: string;
 }
 
 interface ProjectData {
   name: string;
   objects: SceneObject[];
+}
+
+interface ObjectContextMenu {
+  objectIds: string[];
+  x: number;
+  y: number;
 }
 
 const storageKey = "kubi-pro-studio-project-v1";
@@ -155,6 +162,7 @@ function isSceneObject(value: unknown): value is SceneObject {
       object.geometryData.indices.every((component) => Number.isInteger(component) && component >= 0)
     )) &&
     (object.constructionCode === undefined || typeof object.constructionCode === "string") &&
+    (object.groupId === undefined || typeof object.groupId === "string") &&
     (object.type !== "custom" || (object.geometryData !== undefined && object.geometryData !== null))
   );
 }
@@ -366,7 +374,10 @@ function mergeObjects(objects: SceneObject[], ids: string[]): SceneObject {
       locked: mergedObjects.every((object) => object.locked),
       segments: 16,
       geometryData: { positions, indices: [] },
-      constructionCode: mergedObjects.map(getObjectConstructorCode).join(", "),
+      constructionCode: formatCodeCall(
+        "union",
+        mergedObjects.map((object, index) => getObjectConstructorCode(object, index)),
+      ),
     };
   } finally {
     result.geometry.dispose();
@@ -431,6 +442,7 @@ function SceneObjectView({
   mode,
   outlineColor,
   onSelect,
+  onContextMenu,
   onTransforming,
   onCommit,
 }: {
@@ -439,7 +451,8 @@ function SceneObjectView({
   active: boolean;
   mode: TransformMode;
   outlineColor: string;
-  onSelect: (id: string) => void;
+  onSelect: (id: string, additive?: boolean) => void;
+  onContextMenu: (id: string, x: number, y: number) => void;
   onTransforming: (active: boolean) => void;
   onCommit: (id: string, position: Vector3Tuple, rotation: Vector3Tuple, scale: Vector3Tuple) => void;
 }) {
@@ -464,7 +477,12 @@ function SceneObjectView({
       visible={object.visible}
       onClick={(event) => {
         event.stopPropagation();
-        onSelect(object.id);
+        onSelect(object.id, event.nativeEvent.ctrlKey || event.nativeEvent.metaKey);
+      }}
+      onContextMenu={(event) => {
+        event.stopPropagation();
+        event.nativeEvent.preventDefault();
+        onContextMenu(object.id, event.nativeEvent.clientX, event.nativeEvent.clientY);
       }}
     >
       <ObjectGeometry object={object} selected={selected} outlineColor={outlineColor} />
@@ -500,6 +518,7 @@ function ViewportScene({
   viewLocked,
   transforming,
   onSelect,
+  onContextMenu,
   onTransforming,
   onCommit,
 }: {
@@ -511,7 +530,8 @@ function ViewportScene({
   theme: ThemeName;
   viewLocked: boolean;
   transforming: boolean;
-  onSelect: (id: string) => void;
+  onSelect: (id: string, additive?: boolean) => void;
+  onContextMenu: (id: string, x: number, y: number) => void;
   onTransforming: (active: boolean) => void;
   onCommit: (id: string, position: Vector3Tuple, rotation: Vector3Tuple, scale: Vector3Tuple) => void;
 }) {
@@ -553,6 +573,7 @@ function ViewportScene({
           mode={mode}
           outlineColor={viewportTheme.accent}
           onSelect={onSelect}
+          onContextMenu={onContextMenu}
           onTransforming={onTransforming}
           onCommit={onCommit}
         />
@@ -739,22 +760,46 @@ function getCodeName(object: SceneObject, index: number): string {
   return safeName || `${object.type}_${index + 1}`;
 }
 
+function formatCodeCall(name: string, argumentsList: string[]): string {
+  const nestedArguments = argumentsList
+    .map((argument) => `  ${argument.replace(/\n/g, "\n  ")}`)
+    .join(",\n");
+  return `${name}(\n${nestedArguments}\n)`;
+}
+
+function getGroupName(groupId: string): string {
+  const suffix = groupId.replace(/\D/g, "").slice(-4);
+  return `Groupe_${suffix || "1"}`;
+}
+
 function getObjectConstructorCode(object: SceneObject, index: number): string {
   const position = object.position.map(formatCodeNumber).join(", ");
   const rotation = object.rotation.map((radians) => formatCodeNumber(radians * 180 / Math.PI)).join(", ");
   const scale = object.scale.map(formatCodeNumber).join(", ");
-  const properties = `name=${JSON.stringify(getCodeName(object, index))}, position=(${position}), rotation_deg=(${rotation}), scale=(${scale}), segments=${object.segments}, color=${JSON.stringify(object.color)}, visible=${String(object.visible).toLowerCase()}, locked=${String(object.locked).toLowerCase()}`;
-  if (object.type === "custom" && object.constructionCode) return `union(${object.constructionCode}, ${properties})`;
-  return `${object.type}(${properties})`;
+  const properties = [
+    `name=${JSON.stringify(getCodeName(object, index))}`,
+    `position=(${position})`,
+    `rotation_deg=(${rotation})`,
+    `scale=(${scale})`,
+    `segments=${object.segments}`,
+    `color=${JSON.stringify(object.color)}`,
+    `visible=${String(object.visible).toLowerCase()}`,
+    `locked=${String(object.locked).toLowerCase()}`,
+    ...(object.groupId ? [`group=${JSON.stringify(getGroupName(object.groupId))}`] : []),
+  ];
+  if (object.type === "custom" && object.constructionCode) {
+    return formatCodeCall("union", [object.constructionCode, ...properties]);
+  }
+  return formatCodeCall(object.type, properties);
 }
 
 function getObjectCode(object: SceneObject, index: number): string {
-  return `scene.add(${getObjectConstructorCode(object, index)})`;
+  return formatCodeCall("scene.add", [getObjectConstructorCode(object, index)]);
 }
 
 function CodeEditor({ objects, expanded, onToggleExpand }: { objects: SceneObject[]; expanded: boolean; onToggleExpand: () => void }) {
   const [mode, setMode] = useState<CodeMode>("blocks");
-  const codeLines = objects.map(getObjectCode);
+  const codeLines = objects.flatMap((object, index) => getObjectCode(object, index).split("\n"));
 
   function renderCode(line: string) {
     const parts = line.split(/(#.*|"(?:[^"\\]|\\.)*"|\b\d+(?:\.\d+)?\b|\b(?:scene|add|cube|sphere|cylinder|cone|torus|capsule|plane|pyramid|icosphere|octahedron|ring)\b)/g);
@@ -792,6 +837,7 @@ function CodeEditor({ objects, expanded, onToggleExpand }: { objects: SceneObjec
               {objects.map((object) => (
                 <div className="block-object" key={object.id}>
                   <div className={`block-block ${object.type === "custom" ? "block-union" : "block-add"}`}><span className="block-notch" />{object.type === "custom" ? "Assembler" : "Créer"} <strong>{object.type === "custom" ? "solide" : object.type}</strong> <span>« {object.name} »</span></div>
+                  {object.groupId && <div className="block-block block-group"><span className="block-notch" />Groupe <strong>{getGroupName(object.groupId)}</strong> · pièce modifiable</div>}
                   <div className="block-block block-move"><span className="block-notch" />Position <strong>X {formatCodeNumber(object.position[0])}</strong> <strong>Y {formatCodeNumber(object.position[1])}</strong> <strong>Z {formatCodeNumber(object.position[2])}</strong></div>
                   <div className="block-block block-rotate"><span className="block-notch" />Rotation <strong>X {formatCodeNumber(object.rotation[0] * 180 / Math.PI)}°</strong> <strong>Y {formatCodeNumber(object.rotation[1] * 180 / Math.PI)}°</strong> <strong>Z {formatCodeNumber(object.rotation[2] * 180 / Math.PI)}°</strong></div>
                   <div className="block-block block-scale"><span className="block-notch" />Taille <strong>X {formatCodeNumber(object.scale[0])}</strong> <strong>Y {formatCodeNumber(object.scale[1])}</strong> <strong>Z {formatCodeNumber(object.scale[2])}</strong></div>
@@ -810,9 +856,9 @@ function CodeEditor({ objects, expanded, onToggleExpand }: { objects: SceneObjec
           <pre><code>
             {codeLines.length === 0
               ? <span className="code-line"><i>1</i><b className="syntax-comment"># Ajoute une forme pour voir le code de ta scène.</b></span>
-              : codeLines.map((line, index) => <span className="code-line" key={`${objects[index].id}-code`}><i>{index + 1}</i>{renderCode(line)}</span>)}
+              : codeLines.map((line, index) => <span className="code-line" key={`${index}-${line}`}><i>{index + 1}</i>{renderCode(line)}</span>)}
           </code></pre>
-          <div className="code-status"><span /> Code de la scène <span className="code-status-right">{objects.length} objet{objects.length > 1 ? "s" : ""}</span></div>
+          <div className="code-status"><span /> Code de la scène <span className="code-status-right">{objects.length} objet{objects.length > 1 ? "s" : ""} · {codeLines.length} lignes</span></div>
         </div>
       )}
     </section>
@@ -879,14 +925,47 @@ function App() {
   const [codeMaximized, setCodeMaximized] = useState(false);
   const [isTransforming, setIsTransforming] = useState(false);
   const [saveNotice, setSaveNotice] = useState("");
+  const [objectContextMenu, setObjectContextMenu] = useState<ObjectContextMenu | null>(null);
 
   const selectedObject = objects.find((object) => object.id === selectedId);
   const selectedObjects = objects.filter((object) => selectedIds.includes(object.id));
+  const contextObjects = objectContextMenu
+    ? objects.filter((object) => objectContextMenu.objectIds.includes(object.id))
+    : [];
+  const contextGroupId = contextObjects[0]?.groupId;
+  const canUngroupContextSelection = Boolean(contextGroupId) &&
+    contextObjects.every((object) => object.groupId === contextGroupId);
 
   function selectObject(id: string, additive = false) {
+    const clickedObject = objects.find((object) => object.id === id);
+    const relatedIds = clickedObject?.groupId
+      ? objects.filter((object) => object.groupId === clickedObject.groupId).map((object) => object.id)
+      : [id];
+    const orderedRelatedIds = [...relatedIds.filter((relatedId) => relatedId !== id), id];
     setSelectedIds((current) => {
-      if (!additive) return [id];
-      return current.includes(id) ? current.filter((selected) => selected !== id) : [...current, id];
+      if (!additive) return orderedRelatedIds;
+      if (orderedRelatedIds.every((relatedId) => current.includes(relatedId))) {
+        return current.filter((selected) => !orderedRelatedIds.includes(selected));
+      }
+      return [...new Set([...current, ...orderedRelatedIds.filter((relatedId) => relatedId !== id), id])];
+    });
+  }
+
+  function openObjectContextMenu(id: string, x: number, y: number) {
+    const clickedObject = objects.find((object) => object.id === id);
+    if (!clickedObject) return;
+    const selectedTargetIds = selectedIds.includes(id)
+      ? clickedObject.groupId && selectedIds.length === 1
+        ? objects.filter((object) => object.groupId === clickedObject.groupId).map((object) => object.id)
+        : selectedIds
+      : clickedObject.groupId
+        ? objects.filter((object) => object.groupId === clickedObject.groupId).map((object) => object.id)
+        : [id];
+    setSelectedIds(selectedTargetIds);
+    setObjectContextMenu({
+      objectIds: selectedTargetIds,
+      x: Math.max(8, Math.min(x, window.innerWidth - 250)),
+      y: Math.max(8, Math.min(y, window.innerHeight - 230)),
     });
   }
 
@@ -907,7 +986,50 @@ function App() {
   }
 
   const commitTransform = useCallback((id: string, position: Vector3Tuple, rotation: Vector3Tuple, scale: Vector3Tuple) => {
-    setObjects((current) => current.map((object) => object.id === id && !object.locked ? { ...object, position, rotation, scale } : object));
+    setObjects((current) => {
+      const activeObject = current.find((object) => object.id === id);
+      if (!activeObject || activeObject.locked) return current;
+      if (!activeObject.groupId) {
+        return current.map((object) => object.id === id ? { ...object, position, rotation, scale } : object);
+      }
+
+      const previousPosition = new Vector3(...activeObject.position);
+      const nextPosition = new Vector3(...position);
+      const previousRotation = new Quaternion().setFromEuler(new Euler(...activeObject.rotation));
+      const nextRotation = new Quaternion().setFromEuler(new Euler(...rotation));
+      const rotationDelta = nextRotation.clone().multiply(previousRotation.clone().invert());
+      const scaleRatio = scale.map((value, axis) => value / Math.max(activeObject.scale[axis], 0.0001)) as Vector3Tuple;
+
+      return current.map((object) => {
+        if (object.groupId !== activeObject.groupId || object.locked) return object;
+        if (object.id === id) return { ...object, position, rotation, scale };
+
+        const relativePosition = new Vector3(...object.position)
+          .sub(previousPosition)
+          .applyQuaternion(previousRotation.clone().invert());
+        relativePosition.set(
+          relativePosition.x * scaleRatio[0],
+          relativePosition.y * scaleRatio[1],
+          relativePosition.z * scaleRatio[2],
+        );
+        relativePosition.applyQuaternion(nextRotation).add(nextPosition);
+
+        const objectRotation = new Quaternion().setFromEuler(new Euler(...object.rotation));
+        const nextObjectRotation = rotationDelta.clone().multiply(objectRotation);
+        const nextEuler = new Euler().setFromQuaternion(nextObjectRotation);
+
+        return {
+          ...object,
+          position: [relativePosition.x, relativePosition.y, relativePosition.z],
+          rotation: [nextEuler.x, nextEuler.y, nextEuler.z],
+          scale: [
+            object.scale[0] * scaleRatio[0],
+            object.scale[1] * scaleRatio[1],
+            object.scale[2] * scaleRatio[2],
+          ],
+        };
+      });
+    });
     setSaveNotice("");
   }, []);
 
@@ -933,17 +1055,42 @@ function App() {
     setSelectedIds((current) => current.filter((selected) => selected !== id));
   }
 
-  function mergeSelectedObjects() {
-    const mergeIds = selectedObjects.map((object) => object.id);
+  function mergeSelectedObjects(ids = selectedObjects.map((object) => object.id)) {
+    const mergeIds = ids;
     try {
       const merged = mergeObjects(objects, mergeIds);
       setObjects((current) => [...current.filter((object) => !mergeIds.includes(object.id)), merged]);
       setSelectedIds([merged.id]);
+      setObjectContextMenu(null);
       setSaveNotice("Les formes sont fusionnées en un seul solide.");
     } catch (error) {
       console.error("Impossible de fusionner ces formes.", error);
       setSaveNotice(error instanceof Error ? error.message : "Impossible de fusionner ces formes.");
     }
+  }
+
+  function groupObjects(ids: string[]) {
+    if (ids.length < 2) return;
+    const groupId = `group-${Date.now()}`;
+    setObjects((current) => current.map((object) => ids.includes(object.id) ? { ...object, groupId } : object));
+    setObjectContextMenu(null);
+    setSaveNotice("Pièces assemblées : elles restent modifiables.");
+  }
+
+  function ungroupObjects(ids: string[]) {
+    const groupIds = new Set(
+      objects
+        .filter((object) => ids.includes(object.id))
+        .map((object) => object.groupId)
+        .filter((groupId): groupId is string => Boolean(groupId)),
+    );
+    setObjects((current) => current.map((object) => {
+      if (!object.groupId || !groupIds.has(object.groupId)) return object;
+      const { groupId: _groupId, ...ungroupedObject } = object;
+      return ungroupedObject;
+    }));
+    setObjectContextMenu(null);
+    setSaveNotice("Les pièces du groupe sont séparées.");
   }
 
   function saveProject() {
@@ -969,6 +1116,25 @@ function App() {
       console.error("Impossible d’enregistrer le thème.", error);
     }
   }, [theme]);
+
+  useEffect(() => {
+    if (!objectContextMenu) return;
+    function dismissContextMenu(event: PointerEvent | KeyboardEvent) {
+      if (event instanceof KeyboardEvent && event.key === "Escape") {
+        setObjectContextMenu(null);
+        return;
+      }
+      if (event instanceof PointerEvent && event.target instanceof Element && !event.target.closest(".object-context-menu")) {
+        setObjectContextMenu(null);
+      }
+    }
+    document.addEventListener("pointerdown", dismissContextMenu);
+    document.addEventListener("keydown", dismissContextMenu);
+    return () => {
+      document.removeEventListener("pointerdown", dismissContextMenu);
+      document.removeEventListener("keydown", dismissContextMenu);
+    };
+  }, [objectContextMenu]);
 
   function resizeSidePanel(side: "left" | "right", delta: number) {
     if (side === "left") setLeftPanelWidth((width) => Math.min(420, Math.max(190, width + delta)));
@@ -1062,7 +1228,7 @@ function App() {
               <span className="count-badge">{objects.length}</span>
             </div>
             {selectedObjects.length > 1 && (
-              <button type="button" className="merge-selection-button" onClick={mergeSelectedObjects} title="Fusionner les pièces sélectionnées en un seul solide">
+              <button type="button" className="merge-selection-button" onClick={() => mergeSelectedObjects()} title="Fusionner les pièces sélectionnées en un seul solide">
                 <Combine size={14} /> Fusionner {selectedObjects.length} pièces
               </button>
             )}
@@ -1071,12 +1237,20 @@ function App() {
               {objects.map((object, index) => {
                 const Icon = shapeLibrary.find((shape) => shape.type === object.type)?.icon ?? Box;
                 return (
-                  <div key={object.id} className={`hierarchy-row ${selectedIds.includes(object.id) ? "hierarchy-row-selected" : ""}`}>
+                  <div
+                    key={object.id}
+                    className={`hierarchy-row ${selectedIds.includes(object.id) ? "hierarchy-row-selected" : ""}`}
+                    onContextMenu={(event: ReactMouseEvent<HTMLDivElement>) => {
+                      event.preventDefault();
+                      openObjectContextMenu(object.id, event.clientX, event.clientY);
+                    }}
+                  >
                     <span className="tree-indent" />
                     <input type="checkbox" checked={object.visible} onChange={() => toggleVisibility(object.id)} aria-label={`${object.visible ? "Masquer" : "Afficher"} ${object.name}`} />
                     <button className="hierarchy-select" type="button" onClick={(event) => selectObject(object.id, event.ctrlKey || event.metaKey)} aria-pressed={selectedIds.includes(object.id)} title="Ctrl+clic pour sélectionner plusieurs formes">
                       <Icon size={15} style={{ color: object.color }} />
                       <span>{object.name || `${object.type}_${index + 1}`}</span>
+                      {object.groupId && <small className="hierarchy-group-badge">{getGroupName(object.groupId)}</small>}
                     </button>
                     <button type="button" className={`object-row-lock ${object.locked ? "object-row-locked" : ""}`} onClick={() => toggleLock([object.id])} aria-label={object.locked ? `Déverrouiller ${object.name}` : `Verrouiller ${object.name}`} title={object.locked ? "Déverrouiller" : "Verrouiller"}>
                       {object.locked ? <Lock size={13} /> : <Unlock size={13} />}
@@ -1141,7 +1315,8 @@ function App() {
                 theme={theme}
                 viewLocked={sceneViewLocked}
                 transforming={isTransforming}
-                onSelect={(id) => selectObject(id)}
+                onSelect={selectObject}
+                onContextMenu={openObjectContextMenu}
                 onTransforming={setIsTransforming}
                 onCommit={commitTransform}
               />
@@ -1192,6 +1367,66 @@ function App() {
           <CodeEditor objects={objects} expanded={codeMaximized} onToggleExpand={() => setCodeMaximized((maximized) => !maximized)} />
         </aside>
       </div>
+      {objectContextMenu && contextObjects.length > 0 && (
+        <div
+          className="object-context-menu"
+          role="menu"
+          aria-label="Actions sur les objets sélectionnés"
+          style={{ left: objectContextMenu.x, top: objectContextMenu.y }}
+        >
+          <div className="context-menu-title">
+            {contextObjects.length > 1 ? `${contextObjects.length} pièces sélectionnées` : contextObjects[0].name}
+          </div>
+          <label className="context-menu-color" title="Changer la couleur">
+            <Palette size={15} />
+            <span>Changer la couleur</span>
+            <input
+              type="color"
+              value={contextObjects.every((object) => object.color === contextObjects[0].color) ? contextObjects[0].color : "#8B5CF6"}
+              aria-label="Choisir la couleur"
+              disabled={contextObjects.some((object) => object.locked)}
+              onChange={(event) => {
+                updateColor(objectContextMenu.objectIds, event.target.value);
+                setObjectContextMenu(null);
+              }}
+            />
+          </label>
+          {contextObjects.length > 1 && (
+            <>
+              <button
+                type="button"
+                role="menuitem"
+                className="context-menu-action context-menu-merge"
+                onClick={() => mergeSelectedObjects(objectContextMenu.objectIds)}
+              >
+                <Combine size={15} /> Fusionner en une seule pièce
+              </button>
+              {canUngroupContextSelection ? (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="context-menu-action"
+                  onClick={() => ungroupObjects(objectContextMenu.objectIds)}
+                >
+                  <Layers3 size={15} /> Dissocier le groupe
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="context-menu-action"
+                  disabled={contextObjects.some((object) => object.locked)}
+                  onClick={() => groupObjects(objectContextMenu.objectIds)}
+                  title="Les pièces restent séparées et modifiables, mais se déplacent ensemble."
+                >
+                  <Layers3 size={15} /> Grouper / assembler
+                </button>
+              )}
+              <p className="context-menu-hint">Le groupe garde chaque pièce modifiable.</p>
+            </>
+          )}
+        </div>
+      )}
       {saveNotice && <div className="studio-toast" role="status">{saveNotice}</div>}
       <Assistant />
     </main>
