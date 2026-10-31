@@ -1776,7 +1776,8 @@ input:focus-visible {
   gap: 5px;
 }
 .code-expand-button,
-.expand-inspector-button {
+.expand-inspector-button,
+.collapse-inspector-button {
   display: grid;
   place-items: center;
   width: 27px;
@@ -1788,7 +1789,8 @@ input:focus-visible {
   cursor: pointer;
 }
 .code-expand-button:hover,
-.expand-inspector-button:hover {
+.expand-inspector-button:hover,
+.collapse-inspector-button:hover {
   border-color: #8b5cf6;
   color: #fff;
 }
@@ -1808,9 +1810,6 @@ input:focus-visible {
 }
 .inspector-collapsed .panel-kicker {
   margin: 0;
-}
-.right-panel:has(.inspector-collapsed) {
-  grid-template-rows: 42px 5px minmax(0, 1fr) !important;
 }
 .pro-studio[data-theme="light"] .object-lock-button {
   border-color: #cbd5e1;
@@ -1847,13 +1846,15 @@ input:focus-visible {
   background: #ddd6fe;
 }
 .pro-studio[data-theme="light"] .code-expand-button,
-.pro-studio[data-theme="light"] .expand-inspector-button {
+.pro-studio[data-theme="light"] .expand-inspector-button,
+.pro-studio[data-theme="light"] .collapse-inspector-button {
   border-color: #cbd5e1;
   background: #f8fafc;
   color: #475569;
 }
 .pro-studio[data-theme="light"] .code-expand-button:hover,
-.pro-studio[data-theme="light"] .expand-inspector-button:hover {
+.pro-studio[data-theme="light"] .expand-inspector-button:hover,
+.pro-studio[data-theme="light"] .collapse-inspector-button:hover {
   border-color: #8b5cf6;
   color: #4c1d95;
 }
@@ -2482,7 +2483,7 @@ body.resizing-horizontal {
     grid-template-columns: minmax(190px, var(--left-panel-width)) 5px minmax(
         0,
         1fr
-      ) 5px minmax(280px, var(--right-panel-width));
+      ) 5px minmax(300px, var(--right-panel-width));
   }
 }
 @media (max-width: 850px) {
@@ -2501,5 +2502,26 @@ body.resizing-horizontal {
   .right-panel {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto minmax(180px, 1fr);
+  }
+}
+
+.right-panel.code-only {
+  grid-template-rows: 42px minmax(0, 1fr);
+  overflow: hidden;
+}
+.right-panel.code-only .inspector-section {
+  min-height: 42px;
+}
+@media (max-width: 850px) {
+  .right-panel.code-only {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+  .right-panel:not(.code-only) {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(260px, 1fr);
+  }
+  .right-panel:not(.code-only) .resize-horizontal {
+    display: none;
   }
 }

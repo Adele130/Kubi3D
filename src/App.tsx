@@ -57,7 +57,6 @@ import {
   Rotate3D,
   Ruler,
   Send,
-  Settings2,
   Shapes,
   Sparkles,
   Square,
@@ -640,6 +639,7 @@ function Inspector({
   onColorChange,
   onToggleLock,
   onExpand,
+  onCollapse,
 }: {
   object: SceneObject | undefined;
   selectedObjects: SceneObject[];
@@ -649,6 +649,7 @@ function Inspector({
   onColorChange: (ids: string[], color: string) => void;
   onToggleLock: (ids: string[]) => void;
   onExpand: () => void;
+  onCollapse: () => void;
 }) {
   const dimensions = object ? getObjectDimensions(object) : [1, 1, 1] as Vector3Tuple;
   const sharedColor = selectedObjects.length > 0 && selectedObjects.every((item) => item.color === selectedObjects[0].color)
@@ -662,7 +663,7 @@ function Inspector({
         <div className="inspector-title"><span className="panel-kicker">PROPRIÉTÉS</span><h2>Inspecteur</h2></div>
         {collapsed
           ? <button className="expand-inspector-button" type="button" onClick={onExpand} title="Afficher l’inspecteur" aria-label="Afficher l’inspecteur"><Plus size={16} /></button>
-          : <Settings2 size={17} />}
+          : <button className="collapse-inspector-button" type="button" onClick={onCollapse} title="Replier l’inspecteur" aria-label="Replier l’inspecteur"><Minimize2 size={14} /></button>}
       </div>
       {collapsed ? null : selectedObjects.length > 1 ? (
         <>
@@ -824,7 +825,7 @@ function CodeEditor({ objects, expanded, onToggleExpand }: { objects: SceneObjec
             <button type="button" className={mode === "text" ? "code-tab-active" : ""} onClick={() => setMode("text")} role="tab" aria-selected={mode === "text"}>Code Texte</button>
           </div>
           <button type="button" className="code-expand-button" onClick={onToggleExpand} title={expanded ? "Réafficher l’inspecteur" : "Agrandir le code"} aria-label={expanded ? "Réafficher l’inspecteur" : "Agrandir le code"}>
-            {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+            {expanded ? <Maximize2 size={14} /> : <Minimize2 size={14} />}
           </button>
         </div>
       </div>
@@ -919,10 +920,10 @@ function App() {
   const [theme, setTheme] = useState<ThemeName>(loadTheme);
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
   const [leftPanelWidth, setLeftPanelWidth] = useState(250);
-  const [rightPanelWidth, setRightPanelWidth] = useState(340);
+  const [rightPanelWidth, setRightPanelWidth] = useState(420);
   const [inspectorHeight, setInspectorHeight] = useState(390);
   const [sceneViewLocked, setSceneViewLocked] = useState(false);
-  const [codeMaximized, setCodeMaximized] = useState(false);
+  const [codeMaximized, setCodeMaximized] = useState(true);
   const [isTransforming, setIsTransforming] = useState(false);
   const [saveNotice, setSaveNotice] = useState("");
   const [objectContextMenu, setObjectContextMenu] = useState<ObjectContextMenu | null>(null);
@@ -1138,7 +1139,7 @@ function App() {
 
   function resizeSidePanel(side: "left" | "right", delta: number) {
     if (side === "left") setLeftPanelWidth((width) => Math.min(420, Math.max(190, width + delta)));
-    else setRightPanelWidth((width) => Math.min(500, Math.max(280, width - delta)));
+    else setRightPanelWidth((width) => Math.min(560, Math.max(300, width - delta)));
   }
 
   function resizeInspector(delta: number) {
@@ -1349,9 +1350,9 @@ function App() {
         <ResizeHandle orientation="vertical" label="Ajuster le panneau droit" onResize={(delta) => resizeSidePanel("right", delta)} />
 
         <aside
-          className="right-panel"
+          className={`right-panel ${codeMaximized ? "code-only" : ""}`}
           aria-label="Inspecteur et éditeur de code"
-          style={{ "--inspector-height": codeMaximized ? "42px" : `${inspectorHeight}px` } as CSSProperties}
+          style={{ "--inspector-height": `${inspectorHeight}px` } as CSSProperties}
         >
           <Inspector
             object={selectedObject}
@@ -1362,8 +1363,9 @@ function App() {
             onColorChange={updateColor}
             onToggleLock={toggleLock}
             onExpand={() => setCodeMaximized(false)}
+            onCollapse={() => setCodeMaximized(true)}
           />
-          <ResizeHandle orientation="horizontal" label="Ajuster la hauteur de l’inspecteur" onResize={resizeInspector} />
+          {!codeMaximized && <ResizeHandle orientation="horizontal" label="Ajuster la hauteur de l’inspecteur" onResize={resizeInspector} />}
           <CodeEditor objects={objects} expanded={codeMaximized} onToggleExpand={() => setCodeMaximized((maximized) => !maximized)} />
         </aside>
       </div>
