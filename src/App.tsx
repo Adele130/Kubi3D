@@ -1,10 +1,31 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import {
+  BoxGeometry,
+  BufferAttribute,
+  BufferGeometry,
+  CapsuleGeometry,
+  ConeGeometry,
+  CylinderGeometry,
+  Euler,
+  IcosahedronGeometry,
+  Matrix4,
+  MeshStandardMaterial,
+  OctahedronGeometry,
+  Quaternion,
+  SphereGeometry,
+  TorusGeometry,
+  Vector3,
+} from "three";
+import {
+  ADDITION,
+  Brush,
+  Evaluator,
+} from "three-bvh-csg";
+import {
   ContactShadows,
   OrbitControls,
   Outlines,
-  RoundedBox,
   TransformControls,
 } from "@react-three/drei";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
@@ -12,6 +33,7 @@ import type { Group } from "three";
 import {
   Box,
   Check,
+  Combine,
   Contrast,
   ChevronDown,
   ChevronRight,
@@ -23,9 +45,14 @@ import {
   Grid2X2,
   Hexagon,
   Layers3,
+  Lock,
+  LockKeyhole,
+  Maximize2,
+  Minimize2,
   Move3D,
   Palette,
   Pentagon,
+  Plus,
   Plane,
   Rotate3D,
   Ruler,
@@ -36,11 +63,12 @@ import {
   Square,
   Sun,
   Trash2,
+  Unlock,
   X,
 } from "lucide-react";
 import { useCallback } from "react";
 
-type ShapeType = "cube" | "sphere" | "cylinder" | "cone" | "torus" | "capsule" | "plane" | "pyramid" | "icosphere" | "octahedron" | "ring";
+type ShapeType = "cube" | "sphere" | "cylinder" | "cone" | "torus" | "capsule" | "plane" | "pyramid" | "icosphere" | "octahedron" | "ring" | "custom";
 type Axis = 0 | 1 | 2;
 type TransformMode = "translate" | "rotate" | "scale";
 type ViewMode = "Perspective" | "Vue de Haut" | "Vue de Face";
@@ -57,6 +85,10 @@ interface SceneObject {
   scale: Vector3Tuple;
   color: string;
   visible: boolean;
+  locked: boolean;
+  segments: number;
+  geometryData?: { positions: number[]; indices: number[] } | null;
+  constructionCode?: string;
 }
 
 interface ProjectData {
@@ -81,7 +113,7 @@ const shapeLibrary: { type: ShapeType; label: string; icon: typeof Box; color: s
   { type: "ring", label: "Anneau", icon: Contrast, color: "#FBBF24" },
 ];
 
-const objectTypes = new Set<ShapeType>(shapeLibrary.map(({ type }) => type));
+const objectTypes = new Set<ShapeType>([...shapeLibrary.map(({ type }) => type), "custom"]);
 const themes: { id: ThemeName; label: string; color: string; icon: typeof Sun }[] = [
   { id: "dark", label: "Dark mode", color: "#8B5CF6", icon: Contrast },
   { id: "light", label: "Light mode", color: "#06B6D4", icon: Sun },
@@ -108,7 +140,22 @@ function isSceneObject(value: unknown): value is SceneObject {
     isVector(object.rotation) &&
     isVector(object.scale) &&
     typeof object.color === "string" &&
-    typeof object.visible === "boolean"
+    typeof object.visible === "boolean" &&
+    (object.locked === undefined || typeof object.locked === "boolean") &&
+    (object.segments === undefined || (typeof object.segments === "number" && Number.isInteger(object.segments) && object.segments >= 3 && object.segments <= 64)) &&
+    (object.geometryData === undefined || object.geometryData === null || (
+      typeof object.geometryData === "object" &&
+      object.geometryData !== null &&
+      "positions" in object.geometryData &&
+      Array.isArray(object.geometryData.positions) &&
+      object.geometryData.positions.length % 3 === 0 &&
+      object.geometryData.positions.every((component) => typeof component === "number" && Number.isFinite(component)) &&
+      "indices" in object.geometryData &&
+      Array.isArray(object.geometryData.indices) &&
+      object.geometryData.indices.every((component) => Number.isInteger(component) && component >= 0)
+    )) &&
+    (object.constructionCode === undefined || typeof object.constructionCode === "string") &&
+    (object.type !== "custom" || (object.geometryData !== undefined && object.geometryData !== null))
   );
 }
 
@@ -125,7 +172,16 @@ function loadProject(): ProjectData {
       "objects" in parsed &&
       Array.isArray(parsed.objects)
     ) {
-      return { name: parsed.name, objects: parsed.objects.filter(isSceneObject) };
+      return {
+        name: parsed.name,
+        objects: parsed.objects.filter(isSceneObject).map((object) => ({
+          ...object,
+          locked: object.locked ?? false,
+          segments: object.segments ?? (object.type === "pyramid" ? 4 : 16),
+          geometryData: object.geometryData ?? null,
+          constructionCode: object.constructionCode,
+        })),
+      };
     }
   } catch (error) {
     console.error("Impossible de charger le projet enregistré.", error);
@@ -144,47 +200,178 @@ function loadTheme(): ThemeName {
   return "dark";
 }
 
-function createPrimitive(type: ShapeType, index: number): SceneObject {
+function createPrimitive(type: ShapeType, objects: SceneObject[]): SceneObject {
   const preset = shapeLibrary.find((shape) => shape.type === type);
+  const index = objects.length;
+  const existingNames = new Set(objects.map((object) => object.name));
+  let nameIndex = 1;
+  let name = `${preset?.label ?? "Objet"}_${nameIndex}`;
+  while (existingNames.has(name)) {
+    nameIndex += 1;
+    name = `${preset?.label ?? "Objet"}_${nameIndex}`;
+  }
   const slot = index - 1;
   return {
     id: `${type}-${Date.now()}-${index}`,
-    name: `${preset?.label ?? "Objet"}_${index + 1}`,
+    name,
     type,
     position: [index === 0 ? 0 : (slot % 3 - 1) * 1.15, 0.35, index === 0 ? 0 : Math.floor(slot / 3) * 1.1 + 1],
     rotation: [0, 0, 0],
     scale: [1, 1, 1],
     color: preset?.color ?? "#8B5CF6",
     visible: true,
+    locked: false,
+    segments: type === "pyramid" ? 4 : 16,
   };
 }
 
+function makeObjectGeometry(object: SceneObject): BufferGeometry {
+  const segments = Math.min(64, Math.max(3, Math.round(object.segments)));
+  if (object.type === "custom" && object.geometryData) {
+    const geometry = new BufferGeometry();
+    geometry.setAttribute("position", new BufferAttribute(new Float32Array(object.geometryData.positions), 3));
+    geometry.setIndex(object.geometryData.indices.length ? object.geometryData.indices : null);
+    const position = geometry.getAttribute("position");
+    const uv = new Float32Array(position.count * 2);
+    for (let index = 0; index < position.count; index += 1) {
+      uv[index * 2] = position.getX(index);
+      uv[index * 2 + 1] = position.getY(index);
+    }
+    geometry.setAttribute("uv", new BufferAttribute(uv, 2));
+    geometry.computeVertexNormals();
+    return geometry;
+  }
+  switch (object.type) {
+    case "cube": return new BoxGeometry(1, 1, 1, segments, segments, segments);
+    case "sphere": return new SphereGeometry(0.62, segments, Math.max(4, Math.floor(segments * 0.66)));
+    case "cylinder": return new CylinderGeometry(0.5, 0.5, 1, segments);
+    case "cone": return new ConeGeometry(0.55, 1, segments);
+    case "torus":
+    case "ring": return new TorusGeometry(0.42, 0.18, Math.max(3, Math.floor(segments / 2)), segments);
+    case "capsule": return new CapsuleGeometry(0.38, 1, 6, segments);
+    case "plane": return new BoxGeometry(1.3, 0.08, 1.3, segments, 1, segments);
+    case "pyramid": return new ConeGeometry(0.65, 1, Math.min(12, segments));
+    case "icosphere": return new IcosahedronGeometry(0.62, Math.min(5, Math.floor(segments / 8)));
+    case "octahedron": return new OctahedronGeometry(0.65, Math.min(5, Math.floor(segments / 8)));
+    default: throw new Error(`Impossible de créer la géométrie « ${object.type} » sans données de fusion.`);
+  }
+}
+
 function ObjectGeometry({ object, selected, outlineColor }: { object: SceneObject; selected: boolean; outlineColor: string }) {
+  const geometry = useMemo(() => makeObjectGeometry(object), [object.type, object.segments, object.geometryData]);
+  useEffect(() => () => geometry.dispose(), [geometry]);
   const material = <meshStandardMaterial color={object.color} roughness={0.55} metalness={0.12} />;
   const outline = selected ? <Outlines thickness={2.2} color={outlineColor} /> : null;
 
-  if (object.type === "cube") {
-    return (
-      <RoundedBox args={[1, 1, 1]} radius={0.08} smoothness={3} castShadow>
-        {material}{outline}
-      </RoundedBox>
-    );
-  }
   return (
     <mesh castShadow>
-      {object.type === "sphere" && <sphereGeometry args={[0.62, 24, 16]} />}
-      {object.type === "cylinder" && <cylinderGeometry args={[0.5, 0.5, 1, 16]} />}
-      {object.type === "cone" && <coneGeometry args={[0.55, 1, 8]} />}
-      {object.type === "torus" && <torusGeometry args={[0.42, 0.18, 8, 20]} />}
-      {object.type === "capsule" && <capsuleGeometry args={[0.38, 1, 6, 12]} />}
-      {object.type === "plane" && <boxGeometry args={[1.3, 0.08, 1.3]} />}
-      {object.type === "pyramid" && <coneGeometry args={[0.65, 1, 4]} />}
-      {object.type === "icosphere" && <icosahedronGeometry args={[0.62, 1]} />}
-      {object.type === "octahedron" && <octahedronGeometry args={[0.65]} />}
-      {object.type === "ring" && <ringGeometry args={[0.32, 0.65, 24]} />}
+      <primitive object={geometry} attach="geometry" />
       {material}{outline}
     </mesh>
   );
+}
+
+const geometryBaseDimensions: Record<Exclude<ShapeType, "custom">, Vector3Tuple> = {
+  cube: [1, 1, 1],
+  sphere: [1.24, 1.24, 1.24],
+  cylinder: [1, 1, 1],
+  cone: [1.1, 1, 1.1],
+  torus: [1.2, 1.2, 0.36],
+  capsule: [0.76, 2.76, 0.76],
+  plane: [1.3, 0.08, 1.3],
+  pyramid: [1.3, 1, 1.3],
+  icosphere: [1.24, 1.24, 1.24],
+  octahedron: [1.3, 1.3, 1.3],
+  ring: [1.2, 1.2, 0.36],
+};
+
+function getObjectDimensions(object: SceneObject): Vector3Tuple {
+  const baseDimensions = object.type === "custom" && object.geometryData
+    ? getCustomGeometryDimensions(object.geometryData.positions)
+    : geometryBaseDimensions[object.type === "custom" ? "cube" : object.type];
+  return baseDimensions.map((dimension, axis) => dimension * object.scale[axis]) as Vector3Tuple;
+}
+
+function getCustomGeometryDimensions(positions: number[]): Vector3Tuple {
+  const min: Vector3Tuple = [Infinity, Infinity, Infinity];
+  const max: Vector3Tuple = [-Infinity, -Infinity, -Infinity];
+  for (let index = 0; index < positions.length; index += 3) {
+    for (let axis = 0; axis < 3; axis += 1) {
+      min[axis] = Math.min(min[axis], positions[index + axis]);
+      max[axis] = Math.max(max[axis], positions[index + axis]);
+    }
+  }
+  if (!positions.length) return [1, 1, 1];
+  return max.map((value, axis) => Math.max(0.01, value - min[axis])) as Vector3Tuple;
+}
+
+function createWorldBrush(object: SceneObject): Brush {
+  const geometry = makeObjectGeometry(object);
+  const matrix = new Matrix4().compose(
+    new Vector3(...object.position),
+    new Quaternion().setFromEuler(new Euler(...object.rotation)),
+    new Vector3(...object.scale),
+  );
+  geometry.applyMatrix4(matrix);
+  geometry.computeVertexNormals();
+  const brush = new Brush(geometry, new MeshStandardMaterial({ color: "#ffffff" }));
+  brush.updateMatrixWorld(true);
+  brush.prepareGeometry();
+  return brush;
+}
+
+function mergeObjects(objects: SceneObject[], ids: string[]): SceneObject {
+  const mergedObjects = objects.filter((object) => ids.includes(object.id));
+  if (mergedObjects.length < 2) throw new Error("Choisis au moins deux formes pour les assembler.");
+
+  const evaluator = new Evaluator();
+  evaluator.useGroups = false;
+  let result = createWorldBrush(mergedObjects[0]);
+  try {
+    for (const object of mergedObjects.slice(1)) {
+      const next = createWorldBrush(object);
+      try {
+        const merged = evaluator.evaluate(result, next, ADDITION);
+        result.disposeCacheData();
+        result.geometry.dispose();
+        result = merged as Brush;
+      } finally {
+        next.geometry.dispose();
+        next.disposeCacheData();
+      }
+    }
+
+    const flattened = result.geometry.index ? result.geometry.toNonIndexed() : result.geometry.clone();
+    let positions: number[];
+    try {
+      const position = flattened.getAttribute("position");
+      const drawCount = Number.isFinite(flattened.drawRange.count)
+        ? Math.min(flattened.drawRange.count, position.count)
+        : position.count;
+      positions = Array.from(position.array.slice(0, drawCount * 3) as ArrayLike<number>);
+    } finally {
+      flattened.dispose();
+    }
+    if (positions.length < 9) throw new Error("Les formes ne peuvent pas être fusionnées en un solide.");
+
+    return {
+      id: `fusion-${Date.now()}`,
+      name: `Assemblage_${objects.filter((object) => object.type === "custom").length + 1}`,
+      type: "custom",
+      position: [0, 0, 0],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+      color: mergedObjects[0].color,
+      visible: true,
+      locked: mergedObjects.every((object) => object.locked),
+      segments: 16,
+      geometryData: { positions, indices: [] },
+      constructionCode: mergedObjects.map(getObjectConstructorCode).join(", "),
+    };
+  } finally {
+    result.geometry.dispose();
+    result.disposeCacheData();
+  }
 }
 
 function ResizeHandle({
@@ -240,6 +427,7 @@ function ResizeHandle({
 function SceneObjectView({
   object,
   selected,
+  active,
   mode,
   outlineColor,
   onSelect,
@@ -248,27 +436,28 @@ function SceneObjectView({
 }: {
   object: SceneObject;
   selected: boolean;
+  active: boolean;
   mode: TransformMode;
   outlineColor: string;
   onSelect: (id: string) => void;
   onTransforming: (active: boolean) => void;
   onCommit: (id: string, position: Vector3Tuple, rotation: Vector3Tuple, scale: Vector3Tuple) => void;
 }) {
-  const group = useRef<Group>(null);
+  const [group, setGroup] = useState<Group | null>(null);
   const commitTransform = useCallback(() => {
-    if (!group.current) return;
-    const { position, rotation, scale } = group.current;
+    if (!group) return;
+    const { position, rotation, scale } = group;
     onCommit(
       object.id,
       [position.x, position.y, position.z],
       [rotation.x, rotation.y, rotation.z],
       [scale.x, scale.y, scale.z],
     );
-  }, [object.id, onCommit]);
+  }, [group, object.id, onCommit]);
 
   const content = (
     <group
-      ref={group}
+      ref={setGroup}
       position={object.position}
       rotation={object.rotation}
       scale={object.scale}
@@ -282,27 +471,33 @@ function SceneObjectView({
     </group>
   );
 
-  if (!selected || !object.visible) return content;
+  if (!active || !object.visible || object.locked) return content;
   return (
-    <TransformControls
-      mode={mode}
-      onMouseDown={() => onTransforming(true)}
-      onMouseUp={() => {
-        commitTransform();
-        onTransforming(false);
-      }}
-    >
+    <>
+      {group && (
+        <TransformControls
+          object={group}
+          mode={mode}
+          onMouseDown={() => onTransforming(true)}
+          onMouseUp={() => {
+            commitTransform();
+            onTransforming(false);
+          }}
+        />
+      )}
       {content}
-    </TransformControls>
+    </>
   );
 }
 
 function ViewportScene({
   objects,
   selectedId,
+  selectedIds,
   mode,
   viewMode,
   theme,
+  viewLocked,
   transforming,
   onSelect,
   onTransforming,
@@ -310,9 +505,11 @@ function ViewportScene({
 }: {
   objects: SceneObject[];
   selectedId: string | null;
+  selectedIds: string[];
   mode: TransformMode;
   viewMode: ViewMode;
   theme: ThemeName;
+  viewLocked: boolean;
   transforming: boolean;
   onSelect: (id: string) => void;
   onTransforming: (active: boolean) => void;
@@ -351,7 +548,8 @@ function ViewportScene({
         <SceneObjectView
           key={object.id}
           object={object}
-          selected={object.id === selectedId}
+          selected={selectedIds.includes(object.id)}
+          active={object.id === selectedId}
           mode={mode}
           outlineColor={viewportTheme.accent}
           onSelect={onSelect}
@@ -360,7 +558,7 @@ function ViewportScene({
         />
       ))}
       <ContactShadows position={[0, -1.26, 0]} opacity={0.4} scale={16} blur={2.5} far={5} color="#020617" />
-      <OrbitControls ref={controls} makeDefault enabled={!transforming} enablePan enableDamping dampingFactor={0.08} />
+      <OrbitControls ref={controls} makeDefault enabled={!viewLocked && !transforming} enablePan enableDamping dampingFactor={0.08} />
     </>
   );
 }
@@ -371,6 +569,7 @@ function VectorEditor({
   suffix,
   step,
   min,
+  disabled = false,
   onChange,
 }: {
   label: string;
@@ -378,6 +577,7 @@ function VectorEditor({
   suffix?: string;
   step?: number;
   min?: number;
+  disabled?: boolean;
   onChange: (axis: Axis, value: number) => void;
 }) {
   return (
@@ -393,6 +593,7 @@ function VectorEditor({
                 type="number"
                 step={step ?? 0.1}
                 min={min}
+                disabled={disabled}
                 value={Number(value.toFixed(2))}
                 aria-label={`${label} ${axis}`}
                 onChange={(event) => {
@@ -411,69 +612,207 @@ function VectorEditor({
 
 function Inspector({
   object,
+  selectedObjects,
+  collapsed,
   onUpdate,
+  onUpdateSegments,
+  onColorChange,
+  onToggleLock,
+  onExpand,
 }: {
   object: SceneObject | undefined;
+  selectedObjects: SceneObject[];
+  collapsed: boolean;
   onUpdate: (id: string, field: "position" | "rotation" | "scale", axis: Axis, value: number) => void;
+  onUpdateSegments: (id: string, segments: number) => void;
+  onColorChange: (ids: string[], color: string) => void;
+  onToggleLock: (ids: string[]) => void;
+  onExpand: () => void;
 }) {
+  const dimensions = object ? getObjectDimensions(object) : [1, 1, 1] as Vector3Tuple;
+  const sharedColor = selectedObjects.length > 0 && selectedObjects.every((item) => item.color === selectedObjects[0].color)
+    ? selectedObjects[0].color
+    : "#8B5CF6";
+  const allLocked = selectedObjects.length > 0 && selectedObjects.every((item) => item.locked);
+
   return (
-    <section className="inspector-section">
+    <section className={`inspector-section ${collapsed ? "inspector-collapsed" : ""}`}>
       <div className="panel-title-row">
-        <div><span className="panel-kicker">PROPRIÉTÉS</span><h2>Inspecteur</h2></div>
-        <Settings2 size={17} />
+        <div className="inspector-title"><span className="panel-kicker">PROPRIÉTÉS</span><h2>Inspecteur</h2></div>
+        {collapsed
+          ? <button className="expand-inspector-button" type="button" onClick={onExpand} title="Afficher l’inspecteur" aria-label="Afficher l’inspecteur"><Plus size={16} /></button>
+          : <Settings2 size={17} />}
       </div>
-      {!object ? (
+      {collapsed ? null : selectedObjects.length > 1 ? (
+        <>
+          <div className="multi-selection-summary">{selectedObjects.length} pièces sélectionnées</div>
+          <div className="inspector-actions">
+            <button type="button" className={`object-lock-button ${allLocked ? "object-locked" : ""}`} onClick={() => onToggleLock(selectedObjects.map((item) => item.id))}>
+              {allLocked ? <Lock size={14} /> : <Unlock size={14} />}
+              {allLocked ? "Déverrouiller" : "Verrouiller"}
+            </button>
+            <label className="color-control" title="Changer la couleur des pièces sélectionnées">
+              <span>Couleur</span>
+              <input type="color" value={sharedColor} onChange={(event) => onColorChange(selectedObjects.map((item) => item.id), event.target.value)} aria-label="Couleur des formes sélectionnées" disabled={selectedObjects.some((item) => item.locked)} />
+            </label>
+          </div>
+        </>
+      ) : !object ? (
         <div className="empty-selection"><Square size={20} /><span>Sélectionne un objet dans la scène.</span></div>
       ) : (
         <>
           <div className="selected-object-name">
             <span className="object-color-dot" style={{ backgroundColor: object.color }} />
-            <strong>{object.name}</strong><span className="selected-tag">SÉLECTIONNÉ</span>
+            <strong>{object.name}</strong><span className="selected-tag">{object.locked ? "VERROUILLÉ" : "SÉLECTIONNÉ"}</span>
           </div>
-          <VectorEditor label="Position" values={object.position} suffix="m" onChange={(axis, value) => onUpdate(object.id, "position", axis, value)} />
+          <div className="inspector-actions">
+            <button type="button" className={`object-lock-button ${object.locked ? "object-locked" : ""}`} onClick={() => onToggleLock([object.id])}>
+              {object.locked ? <Lock size={14} /> : <Unlock size={14} />}
+              {object.locked ? "Déverrouiller" : "Verrouiller"}
+            </button>
+            <label className="color-control" title="Changer la couleur">
+              <span>Couleur</span>
+              <input type="color" value={object.color} onChange={(event) => onColorChange([object.id], event.target.value)} aria-label="Couleur de la forme" disabled={object.locked} />
+            </label>
+          </div>
+          <VectorEditor label="Position" values={object.position} suffix="m" disabled={object.locked} onChange={(axis, value) => onUpdate(object.id, "position", axis, value)} />
           <VectorEditor
             label="Rotation"
             values={object.rotation.map((radians) => radians * 180 / Math.PI) as Vector3Tuple}
             suffix="°"
             step={1}
+            disabled={object.locked}
             onChange={(axis, value) => onUpdate(object.id, "rotation", axis, value * Math.PI / 180)}
           />
-          <VectorEditor label="Échelle" values={object.scale} step={0.1} min={0.1} onChange={(axis, value) => onUpdate(object.id, "scale", axis, Math.max(0.1, value))} />
+          <VectorEditor
+            label="Dimensions"
+            values={dimensions}
+            suffix="m"
+            step={0.1}
+            min={0.1}
+            disabled={object.locked}
+            onChange={(axis, value) => {
+              const base = object.type === "custom" && object.geometryData
+                ? getCustomGeometryDimensions(object.geometryData.positions)
+                : geometryBaseDimensions[object.type === "custom" ? "cube" : object.type];
+              onUpdate(object.id, "scale", axis, Math.max(0.1, value) / Math.max(0.01, base[axis]));
+            }}
+          />
+          {object.type !== "custom" && (
+            <label className="segments-control">
+              <span>{object.type === "cube" || object.type === "plane" ? "Détail des faces" : "Nombre de côtés"}</span>
+              <input
+                type="number"
+                min={3}
+                max={64}
+                step={1}
+                value={object.segments}
+                aria-label="Détail de la forme"
+                disabled={object.locked}
+                onChange={(event) => {
+                  const segments = Math.min(64, Math.max(3, Math.round(Number(event.target.value))));
+                  if (Number.isFinite(segments)) onUpdateSegments(object.id, segments);
+                }}
+              />
+            </label>
+          )}
         </>
       )}
-      <div className="inspector-note"><span className="note-dot" /> Les valeurs se mettent à jour avec le Gizmo.</div>
+      {!collapsed && <div className="inspector-note"><span className="note-dot" /> Modifie la pièce dans la vue ou ici.</div>}
     </section>
   );
 }
 
-function CodeEditor({ object }: { object: SceneObject | undefined }) {
+function formatCodeNumber(value: number): string {
+  const normalized = Math.abs(value) < 0.005 ? 0 : value;
+  return normalized.toFixed(2).replace(/\.?0+$/, "");
+}
+
+function getCodeName(object: SceneObject, index: number): string {
+  const normalized = object.name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9_]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const safeName = /^[a-zA-Z_]/.test(normalized) ? normalized : `objet_${normalized}`;
+  return safeName || `${object.type}_${index + 1}`;
+}
+
+function getObjectConstructorCode(object: SceneObject, index: number): string {
+  const position = object.position.map(formatCodeNumber).join(", ");
+  const rotation = object.rotation.map((radians) => formatCodeNumber(radians * 180 / Math.PI)).join(", ");
+  const scale = object.scale.map(formatCodeNumber).join(", ");
+  const properties = `name=${JSON.stringify(getCodeName(object, index))}, position=(${position}), rotation_deg=(${rotation}), scale=(${scale}), segments=${object.segments}, color=${JSON.stringify(object.color)}, visible=${String(object.visible).toLowerCase()}, locked=${String(object.locked).toLowerCase()}`;
+  if (object.type === "custom" && object.constructionCode) return `union(${object.constructionCode}, ${properties})`;
+  return `${object.type}(${properties})`;
+}
+
+function getObjectCode(object: SceneObject, index: number): string {
+  return `scene.add(${getObjectConstructorCode(object, index)})`;
+}
+
+function CodeEditor({ objects, expanded, onToggleExpand }: { objects: SceneObject[]; expanded: boolean; onToggleExpand: () => void }) {
   const [mode, setMode] = useState<CodeMode>("blocks");
+  const codeLines = objects.map(getObjectCode);
+
+  function renderCode(line: string) {
+    const parts = line.split(/(#.*|"(?:[^"\\]|\\.)*"|\b\d+(?:\.\d+)?\b|\b(?:scene|add|cube|sphere|cylinder|cone|torus|capsule|plane|pyramid|icosphere|octahedron|ring)\b)/g);
+    return parts.map((part, index) => {
+      let className = "";
+      if (part.startsWith("#")) className = "syntax-comment";
+      else if (part.startsWith('"')) className = "syntax-string";
+      else if (/^\d/.test(part)) className = "syntax-number";
+      else if (part && /^(cube|sphere|cylinder|cone|torus|capsule|plane|pyramid|icosphere|octahedron|ring|add)$/.test(part)) className = "syntax-function";
+      else if (part === "scene") className = "syntax-variable";
+      return className ? <b className={className} key={`${part}-${index}`}>{part}</b> : part;
+    });
+  }
+
   return (
     <section className="code-section">
       <div className="code-heading">
         <div><span className="panel-kicker">APPRENTISSAGE</span><h2>Mon code</h2></div>
-        <div className="code-tabs" role="tablist" aria-label="Mode de programmation">
-          <button type="button" className={mode === "blocks" ? "code-tab-active" : ""} onClick={() => setMode("blocks")} role="tab" aria-selected={mode === "blocks"}>Blocs</button>
-          <button type="button" className={mode === "text" ? "code-tab-active" : ""} onClick={() => setMode("text")} role="tab" aria-selected={mode === "text"}>Code Texte</button>
+        <div className="code-heading-actions">
+          <div className="code-tabs" role="tablist" aria-label="Mode de programmation">
+            <button type="button" className={mode === "blocks" ? "code-tab-active" : ""} onClick={() => setMode("blocks")} role="tab" aria-selected={mode === "blocks"}>Blocs</button>
+            <button type="button" className={mode === "text" ? "code-tab-active" : ""} onClick={() => setMode("text")} role="tab" aria-selected={mode === "text"}>Code Texte</button>
+          </div>
+          <button type="button" className="code-expand-button" onClick={onToggleExpand} title={expanded ? "Réafficher l’inspecteur" : "Agrandir le code"} aria-label={expanded ? "Réafficher l’inspecteur" : "Agrandir le code"}>
+            {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+          </button>
         </div>
       </div>
       {mode === "blocks" ? (
         <div className="block-workspace" role="tabpanel">
-          <div className="block-block block-event"><span className="block-notch" />Quand je lance mon bolide</div>
-          <div className="block-block block-add"><span className="block-notch" />Ajouter <strong>{object?.type ?? "cube"}</strong> à la scène</div>
-          <div className="block-block block-move"><span className="block-notch" />Déplacer sur <strong>X</strong> de <strong>5</strong></div>
-          <div className="block-hint"><Sparkles size={13} /> Assemble les blocs pour coder ton objet.</div>
+          {objects.length === 0 ? (
+            <div className="block-empty"><Sparkles size={14} /> Ajoute une forme dans la scène pour voir ses blocs ici.</div>
+          ) : (
+            <div className="block-object-list">
+              {objects.map((object) => (
+                <div className="block-object" key={object.id}>
+                  <div className={`block-block ${object.type === "custom" ? "block-union" : "block-add"}`}><span className="block-notch" />{object.type === "custom" ? "Assembler" : "Créer"} <strong>{object.type === "custom" ? "solide" : object.type}</strong> <span>« {object.name} »</span></div>
+                  <div className="block-block block-move"><span className="block-notch" />Position <strong>X {formatCodeNumber(object.position[0])}</strong> <strong>Y {formatCodeNumber(object.position[1])}</strong> <strong>Z {formatCodeNumber(object.position[2])}</strong></div>
+                  <div className="block-block block-rotate"><span className="block-notch" />Rotation <strong>X {formatCodeNumber(object.rotation[0] * 180 / Math.PI)}°</strong> <strong>Y {formatCodeNumber(object.rotation[1] * 180 / Math.PI)}°</strong> <strong>Z {formatCodeNumber(object.rotation[2] * 180 / Math.PI)}°</strong></div>
+                  <div className="block-block block-scale"><span className="block-notch" />Taille <strong>X {formatCodeNumber(object.scale[0])}</strong> <strong>Y {formatCodeNumber(object.scale[1])}</strong> <strong>Z {formatCodeNumber(object.scale[2])}</strong></div>
+                  {object.type !== "custom" && <div className="block-block block-detail"><span className="block-notch" />Détail <strong>{object.segments} côtés</strong></div>}
+                  <div className="block-block block-color"><span className="block-notch" />Couleur <strong><i style={{ backgroundColor: object.color }} />{object.color}</strong></div>
+                  <div className="block-block block-visibility"><span className="block-notch" />{object.visible ? "Afficher" : "Masquer"} <strong>{object.name}</strong> · {object.locked ? "Verrouillé" : "Déverrouillé"}</div>
+                </div>
+              ))}
+            </div>
+          )}
+          {objects.length > 0 && <div className="block-hint"><Sparkles size={13} /> Les blocs suivent les formes de ta scène.</div>}
         </div>
       ) : (
         <div className="text-editor" role="tabpanel" aria-label="Éditeur de code texte">
-          <div className="editor-file"><Code2 size={14} /><span>mon_bolide.py</span><span className="editor-dot" /></div>
+          <div className="editor-file"><Code2 size={14} /><span>scene.py</span><span className="editor-dot" /></div>
           <pre><code>
-            <span className="code-line"><i>1</i><b className="syntax-variable">voiture</b> <em>=</em> <b className="syntax-type">Object3D</b>(<b className="syntax-string">&quot;Mon_Bolide&quot;</b>)</span>
-            <span className="code-line"><i>2</i><b className="syntax-variable">voiture</b>.<b className="syntax-function">add</b>(<b className="syntax-function">cube</b>(<b className="syntax-number">10</b>, <b className="syntax-number">5</b>, <b className="syntax-number">2</b>))</span>
-            <span className="code-line"><i>3</i><b className="syntax-variable">voiture</b>.<b className="syntax-function">move_x</b>(<b className="syntax-number">5</b>)</span>
-            <span className="code-line"><i>4</i><b className="syntax-comment"># à toi de jouer !</b></span>
+            {codeLines.length === 0
+              ? <span className="code-line"><i>1</i><b className="syntax-comment"># Ajoute une forme pour voir le code de ta scène.</b></span>
+              : codeLines.map((line, index) => <span className="code-line" key={`${objects[index].id}-code`}><i>{index + 1}</i>{renderCode(line)}</span>)}
           </code></pre>
-          <div className="code-status"><span /> Python junior <span className="code-status-right">3 lignes</span></div>
+          <div className="code-status"><span /> Code de la scène <span className="code-status-right">{objects.length} objet{objects.length > 1 ? "s" : ""}</span></div>
         </div>
       )}
     </section>
@@ -527,7 +866,8 @@ function App() {
   const initialProject = useMemo(loadProject, []);
   const [projectName, setProjectName] = useState(initialProject.name);
   const [objects, setObjects] = useState(initialProject.objects);
-  const [selectedId, setSelectedId] = useState<string | null>(initialProject.objects[0]?.id ?? null);
+  const [selectedIds, setSelectedIds] = useState<string[]>(initialProject.objects[0] ? [initialProject.objects[0].id] : []);
+  const selectedId = selectedIds[selectedIds.length - 1] ?? null;
   const [mode, setMode] = useState<TransformMode>("translate");
   const [viewMode, setViewMode] = useState<ViewMode>("Perspective");
   const [theme, setTheme] = useState<ThemeName>(loadTheme);
@@ -535,20 +875,30 @@ function App() {
   const [leftPanelWidth, setLeftPanelWidth] = useState(250);
   const [rightPanelWidth, setRightPanelWidth] = useState(340);
   const [inspectorHeight, setInspectorHeight] = useState(390);
-  const [saveNotice, setSaveNotice] = useState("");
+  const [sceneViewLocked, setSceneViewLocked] = useState(false);
+  const [codeMaximized, setCodeMaximized] = useState(false);
   const [isTransforming, setIsTransforming] = useState(false);
+  const [saveNotice, setSaveNotice] = useState("");
 
   const selectedObject = objects.find((object) => object.id === selectedId);
+  const selectedObjects = objects.filter((object) => selectedIds.includes(object.id));
+
+  function selectObject(id: string, additive = false) {
+    setSelectedIds((current) => {
+      if (!additive) return [id];
+      return current.includes(id) ? current.filter((selected) => selected !== id) : [...current, id];
+    });
+  }
 
   function addObject(type: ShapeType) {
-    const object = createPrimitive(type, objects.length);
+    const object = createPrimitive(type, objects);
     setObjects((current) => [...current, object]);
-    setSelectedId(object.id);
+    selectObject(object.id);
   }
 
   function updateObjectField(id: string, field: "position" | "rotation" | "scale", axis: Axis, value: number) {
     setObjects((current) => current.map((object) => {
-      if (object.id !== id) return object;
+      if (object.id !== id || object.locked) return object;
       const next = [...object[field]] as Vector3Tuple;
       next[axis] = value;
       return { ...object, [field]: next };
@@ -557,7 +907,7 @@ function App() {
   }
 
   const commitTransform = useCallback((id: string, position: Vector3Tuple, rotation: Vector3Tuple, scale: Vector3Tuple) => {
-    setObjects((current) => current.map((object) => object.id === id ? { ...object, position, rotation, scale } : object));
+    setObjects((current) => current.map((object) => object.id === id && !object.locked ? { ...object, position, rotation, scale } : object));
     setSaveNotice("");
   }, []);
 
@@ -565,9 +915,35 @@ function App() {
     setObjects((current) => current.map((object) => object.id === id ? { ...object, visible: !object.visible } : object));
   }
 
+  function toggleLock(ids: string[]) {
+    const shouldUnlock = objects.filter((object) => ids.includes(object.id)).every((object) => object.locked);
+    setObjects((current) => current.map((object) => ids.includes(object.id) ? { ...object, locked: !shouldUnlock } : object));
+  }
+
+  function updateColor(ids: string[], color: string) {
+    setObjects((current) => current.map((object) => ids.includes(object.id) ? { ...object, color } : object));
+  }
+
+  function updateSegments(id: string, segments: number) {
+    setObjects((current) => current.map((object) => object.id === id && !object.locked ? { ...object, segments } : object));
+  }
+
   function deleteObject(id: string) {
     setObjects((current) => current.filter((object) => object.id !== id));
-    if (selectedId === id) setSelectedId(objects.find((object) => object.id !== id)?.id ?? null);
+    setSelectedIds((current) => current.filter((selected) => selected !== id));
+  }
+
+  function mergeSelectedObjects() {
+    const mergeIds = selectedObjects.map((object) => object.id);
+    try {
+      const merged = mergeObjects(objects, mergeIds);
+      setObjects((current) => [...current.filter((object) => !mergeIds.includes(object.id)), merged]);
+      setSelectedIds([merged.id]);
+      setSaveNotice("Les formes sont fusionnées en un seul solide.");
+    } catch (error) {
+      console.error("Impossible de fusionner ces formes.", error);
+      setSaveNotice(error instanceof Error ? error.message : "Impossible de fusionner ces formes.");
+    }
   }
 
   function saveProject() {
@@ -610,13 +986,13 @@ function App() {
       if (event.key.toLowerCase() === "w") setMode("translate");
       if (event.key.toLowerCase() === "e") setMode("rotate");
       if (event.key.toLowerCase() === "r") setMode("scale");
-      if (event.key === "Delete" && selectedId) {
-        deleteObject(selectedId);
+      if (event.key === "Delete" && selectedIds.length) {
+        selectedIds.forEach(deleteObject);
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedId, objects]);
+  }, [selectedIds, objects]);
 
   return (
     <main className="pro-studio" data-theme={theme}>
@@ -685,17 +1061,25 @@ function App() {
               <div><Layers3 size={15} /><h2>Objets de la scène</h2></div>
               <span className="count-badge">{objects.length}</span>
             </div>
+            {selectedObjects.length > 1 && (
+              <button type="button" className="merge-selection-button" onClick={mergeSelectedObjects} title="Fusionner les pièces sélectionnées en un seul solide">
+                <Combine size={14} /> Fusionner {selectedObjects.length} pièces
+              </button>
+            )}
             <div className="tree-root"><ChevronDown size={14} /><Box size={15} /><span>{projectName || "Ma scène"}</span></div>
             <div className="hierarchy-list">
               {objects.map((object, index) => {
                 const Icon = shapeLibrary.find((shape) => shape.type === object.type)?.icon ?? Box;
                 return (
-                  <div key={object.id} className={`hierarchy-row ${object.id === selectedId ? "hierarchy-row-selected" : ""}`}>
+                  <div key={object.id} className={`hierarchy-row ${selectedIds.includes(object.id) ? "hierarchy-row-selected" : ""}`}>
                     <span className="tree-indent" />
                     <input type="checkbox" checked={object.visible} onChange={() => toggleVisibility(object.id)} aria-label={`${object.visible ? "Masquer" : "Afficher"} ${object.name}`} />
-                    <button className="hierarchy-select" type="button" onClick={() => setSelectedId(object.id)} aria-pressed={object.id === selectedId}>
+                    <button className="hierarchy-select" type="button" onClick={(event) => selectObject(object.id, event.ctrlKey || event.metaKey)} aria-pressed={selectedIds.includes(object.id)} title="Ctrl+clic pour sélectionner plusieurs formes">
                       <Icon size={15} style={{ color: object.color }} />
                       <span>{object.name || `${object.type}_${index + 1}`}</span>
+                    </button>
+                    <button type="button" className={`object-row-lock ${object.locked ? "object-row-locked" : ""}`} onClick={() => toggleLock([object.id])} aria-label={object.locked ? `Déverrouiller ${object.name}` : `Verrouiller ${object.name}`} title={object.locked ? "Déverrouiller" : "Verrouiller"}>
+                      {object.locked ? <Lock size={13} /> : <Unlock size={13} />}
                     </button>
                   </div>
                 );
@@ -751,11 +1135,13 @@ function App() {
               <ViewportScene
                 objects={objects}
                 selectedId={selectedId}
+                selectedIds={selectedIds}
                 mode={mode}
                 viewMode={viewMode}
                 theme={theme}
+                viewLocked={sceneViewLocked}
                 transforming={isTransforming}
-                onSelect={setSelectedId}
+                onSelect={(id) => selectObject(id)}
                 onTransforming={setIsTransforming}
                 onCommit={commitTransform}
               />
@@ -771,6 +1157,16 @@ function App() {
               <span><i className="axis-x-line" />X</span><span><i className="axis-y-line" />Y</span><span><i className="axis-z-line" />Z</span>
               <small>AXES</small>
             </div>
+            <button
+              type="button"
+              className={`view-lock-button ${sceneViewLocked ? "view-locked" : ""}`}
+              onClick={() => setSceneViewLocked((locked) => !locked)}
+              aria-pressed={sceneViewLocked}
+              title={sceneViewLocked ? "Déverrouiller la caméra de la scène" : "Verrouiller la caméra de la scène"}
+            >
+              {sceneViewLocked ? <LockKeyhole size={14} /> : <Unlock size={14} />}
+              <span>{sceneViewLocked ? "Vue verrouillée" : "Verrouiller la vue"}</span>
+            </button>
             <div className="viewport-footer"><span><span className="live-dot" /> Scène active</span><span>Grille 1 m</span><span>Perspective · 100%</span></div>
           </div>
         </section>
@@ -780,14 +1176,20 @@ function App() {
         <aside
           className="right-panel"
           aria-label="Inspecteur et éditeur de code"
-          style={{ "--inspector-height": `${inspectorHeight}px` } as CSSProperties}
+          style={{ "--inspector-height": codeMaximized ? "42px" : `${inspectorHeight}px` } as CSSProperties}
         >
           <Inspector
             object={selectedObject}
+            selectedObjects={selectedObjects}
+            collapsed={codeMaximized}
             onUpdate={updateObjectField}
+            onUpdateSegments={updateSegments}
+            onColorChange={updateColor}
+            onToggleLock={toggleLock}
+            onExpand={() => setCodeMaximized(false)}
           />
           <ResizeHandle orientation="horizontal" label="Ajuster la hauteur de l’inspecteur" onResize={resizeInspector} />
-          <CodeEditor object={selectedObject} />
+          <CodeEditor objects={objects} expanded={codeMaximized} onToggleExpand={() => setCodeMaximized((maximized) => !maximized)} />
         </aside>
       </div>
       {saveNotice && <div className="studio-toast" role="status">{saveNotice}</div>}
